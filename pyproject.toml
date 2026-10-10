@@ -8,3 +8,8 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# dbus-fast reads D-Bus signatures from annotations ("s", "a{sv}", ...),
+# which ruff takes for forward references.
+"meta_librespot_mpris.py" = ["F821", "F722", "UP037"]

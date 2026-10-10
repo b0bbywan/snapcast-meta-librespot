@@ -33,6 +33,7 @@ import selectors
 import socket
 import sys
 import tempfile
+import time
 
 SOCKET_NAME = "snapcast-meta-librespot.sock"
 MAX_DATAGRAM = 65536
@@ -122,6 +123,12 @@ class Player:
             "canGoPrevious": False,
             "canSeek": False,
         }
+        self.position_at = time.monotonic()
+
+    def set_position(self, position: float) -> None:
+        self.properties["position"] = position
+        # Stamped so a reader can extrapolate while playing.
+        self.position_at = time.monotonic()
 
     def handle_event(self, event: dict) -> bool:
         """Apply one hook payload; return whether properties changed.
@@ -133,14 +140,14 @@ class Player:
         # track is not playing yet, track_changed says when it is.
         if name == "track_changed":
             props["metadata"] = track_metadata(event)
-            props["position"] = 0.0
+            self.set_position(0.0)
         elif name in ("playing", "paused"):
             props["playbackStatus"] = name
-            props["position"] = seconds(event["POSITION_MS"])
+            self.set_position(seconds(event["POSITION_MS"]))
         elif name == "stopped":
             props["playbackStatus"] = "stopped"
         elif name in ("seeked", "position_correction"):
-            props["position"] = seconds(event["POSITION_MS"])
+            self.set_position(seconds(event["POSITION_MS"]))
         elif name == "volume_changed":
             props["volume"] = round(int(event["VOLUME"]) * 100 / LIBRESPOT_MAX_VOLUME)
         elif name == "shuffle_changed":
