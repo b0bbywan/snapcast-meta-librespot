@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.11'
+      # The MPRIS tests run both roles on a private session bus; without
+      # dbus-daemon they would be skipped, not failed.
+      - name: Install dbus-daemon
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus-daemon
+      - name: Install deps
+        run: uv sync --locked
+      - name: ruff
+        run: uv run ruff check .
+      - name: mypy
+        if: always()
+        run: uv run mypy
+      - name: Pytest
+        if: always()
+        run: uv run pytest -q -rs
