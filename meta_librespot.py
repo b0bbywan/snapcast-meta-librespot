@@ -25,11 +25,11 @@ One file, two roles, told apart by PLAYER_EVENT in the environment:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import copy
 import json
 import os
-import selectors
 import socket
 import sys
 import tempfile
@@ -171,14 +171,17 @@ def log(severity: str, message: str) -> None:
     send({"jsonrpc": "2.0", "method": "Plugin.Stream.Log", "params": {"severity": severity, "message": message}})
 
 
-def handle_datagram(player: Player, data: bytes) -> None:
+def handle_datagram(player: Player, data: bytes) -> str | None:
+    """Apply one hook datagram; return the event name, or None if rejected."""
     try:
-        changed = player.handle_event(json.loads(data))
-    except (KeyError, ValueError) as e:
+        event = json.loads(data)
+        changed = player.handle_event(event)
+    except (KeyError, TypeError, ValueError) as e:
         log("warning", f"ignoring malformed librespot event ({e!r}): {data[:200]!r}")
-        return
+        return None
     if changed:
         send({"jsonrpc": "2.0", "method": "Plugin.Stream.Player.Properties", "params": player.properties})
+    return str(event["PLAYER_EVENT"])
 
 
 def handle_request(player: Player, line: bytes) -> None:
@@ -195,7 +198,7 @@ def handle_request(player: Player, line: bytes) -> None:
         send({"jsonrpc": "2.0", "id": req_id, "error": error})
 
 
-def run_control() -> int:
+async def run_control(mpris: bool) -> int:
     path = socket_path()
     # A previous instance killed by snapserver leaves its socket file behind.
     with contextlib.suppress(FileNotFoundError):
@@ -203,26 +206,41 @@ def run_control() -> int:
     events = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     events.bind(path)
     stdin_fd = sys.stdin.fileno()
-    sel = selectors.DefaultSelector()
-    sel.register(events, selectors.EVENT_READ)
-    sel.register(stdin_fd, selectors.EVENT_READ)
+    loop = asyncio.get_running_loop()
+    stdin_closed = loop.create_future()
 
     player = Player()
-    send({"jsonrpc": "2.0", "method": "Plugin.Stream.Ready"})
+    view = None
     pending = b""
+
+    def on_event() -> None:
+        name = handle_datagram(player, events.recv(MAX_DATAGRAM))
+        if view is not None and name is not None:
+            view.sync(name)
+
+    def on_stdin() -> None:
+        nonlocal pending
+        chunk = os.read(stdin_fd, 4096)
+        if not chunk:  # snapserver closed our stdin
+            loop.remove_reader(stdin_fd)
+            stdin_closed.set_result(None)
+            return
+        *lines, pending = (pending + chunk).split(b"\n")
+        for line in lines:
+            if line.strip():
+                handle_request(player, line)
+
     try:
-        while True:
-            for key, _ in sel.select():
-                if key.fileobj is events:
-                    handle_datagram(player, events.recv(MAX_DATAGRAM))
-                    continue
-                chunk = os.read(stdin_fd, 4096)
-                if not chunk:
-                    return 0  # snapserver closed our stdin
-                *lines, pending = (pending + chunk).split(b"\n")
-                for line in lines:
-                    if line.strip():
-                        handle_request(player, line)
+        if mpris:
+            # Imported on demand: dbus-fast is only required with --mpris.
+            import meta_librespot_mpris
+
+            view = await meta_librespot_mpris.export(player)
+        loop.add_reader(events, on_event)
+        loop.add_reader(stdin_fd, on_stdin)
+        send({"jsonrpc": "2.0", "method": "Plugin.Stream.Ready"})
+        await stdin_closed
+        return 0
     finally:
         events.close()
         with contextlib.suppress(FileNotFoundError):
@@ -235,14 +253,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--stream", help="snapcast stream id (passed by snapserver, unused)")
     parser.add_argument("--snapcast-host", help="snapserver HTTP host (passed by snapserver, unused)")
     parser.add_argument("--snapcast-port", help="snapserver HTTP port (passed by snapserver, unused)")
+    parser.add_argument("--mpris", action="store_true", help="also publish a read-only MPRIS player on the session bus")
     return parser.parse_args(argv)
 
 
 def main() -> int:
     if "PLAYER_EVENT" in os.environ:
         return run_hook()
-    parse_args(sys.argv[1:])
-    return run_control()
+    args = parse_args(sys.argv[1:])
+    return asyncio.run(run_control(args.mpris))
 
 
 if __name__ == "__main__":

@@ -1,12 +1,30 @@
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+import sys
+
 import pytest
 
 pytest.importorskip("dbus_fast")
 
-from test_meta_librespot import TRACK_EVENT  # noqa: E402
+from dbus_fast import BusType, Message, MessageType  # noqa: E402
+from dbus_fast.aio import MessageBus  # noqa: E402
+from test_meta_librespot import SCRIPT, TRACK_EVENT, run_hook  # noqa: E402
 
 import meta_librespot_mpris  # noqa: E402
 from meta_librespot import Player  # noqa: E402
-from meta_librespot_mpris import NO_TRACK, PlayerInterface, mpris_metadata, track_path  # noqa: E402
+from meta_librespot_mpris import (  # noqa: E402
+    BUS_NAME,
+    NO_TRACK,
+    ROOT_PATH,
+    PlayerInterface,
+    mpris_metadata,
+    track_path,
+)
+
+PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 
 
 def plain(metadata: dict) -> dict:
@@ -100,3 +118,94 @@ def test_position_is_capped_at_track_duration(view, monkeypatch):
     feed(view, {"PLAYER_EVENT": "playing", "POSITION_MS": "230000"})
     now[0] += 3600
     assert view._position_us() == 232_500_000
+
+
+# --- on a private session bus, as real processes -----------------------
+@pytest.fixture
+def bus_address():
+    if shutil.which("dbus-daemon") is None:
+        pytest.skip("dbus-daemon not available")
+    daemon = subprocess.Popen(
+        ["dbus-daemon", "--session", "--nofork", "--print-address"], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        yield daemon.stdout.readline().strip()
+    finally:
+        daemon.kill()
+        daemon.wait()
+
+
+async def call(bus: MessageBus, interface: str, member: str, signature: str = "", body: list | None = None) -> Message:
+    message = Message(
+        destination=BUS_NAME, path=ROOT_PATH, interface=interface, member=member, signature=signature, body=body or []
+    )
+    return await bus.call(message)
+
+
+def start_control(env: dict) -> subprocess.Popen:
+    args = [sys.executable, str(SCRIPT), "--stream=SpotifyHD", "--mpris"]
+    pipe = subprocess.PIPE
+    return subprocess.Popen(args, env=env, stdin=pipe, stdout=pipe, stderr=pipe, text=True)
+
+
+def test_mpris_end_to_end(tmp_path, bus_address):
+    env = {"PATH": os.environ["PATH"], "XDG_RUNTIME_DIR": str(tmp_path), "DBUS_SESSION_BUS_ADDRESS": bus_address}
+    ctrl = start_control(env)
+    try:
+        assert json.loads(ctrl.stdout.readline())["method"] == "Plugin.Stream.Ready"
+        assert run_hook(tmp_path, {"PLAYER_EVENT": "preloading", "TRACK_ID": "next"}).returncode == 0
+        assert run_hook(tmp_path, TRACK_EVENT).returncode == 0
+        assert run_hook(tmp_path, {"PLAYER_EVENT": "playing", "POSITION_MS": "42000"}).returncode == 0
+        # Both notifications to snapserver are out, so MPRIS is in sync too.
+        ctrl.stdout.readline()
+        ctrl.stdout.readline()
+
+        async def read_player() -> tuple[dict, Message, Message]:
+            bus = await MessageBus(bus_address=bus_address, bus_type=BusType.SESSION).connect()
+            get_all = "org.freedesktop.DBus.Properties", "GetAll", "s"
+            props = (await call(bus, *get_all, [PLAYER_IFACE])).body[0]
+            root = await call(bus, *get_all, ["org.mpris.MediaPlayer2"])
+            refused = await call(bus, PLAYER_IFACE, "Next")
+            bus.disconnect()
+            return props, root, refused
+
+        props, root, refused = asyncio.run(read_player())
+        assert props["PlaybackStatus"].value == "Playing"
+        assert props["Metadata"].value["xesam:title"].value == "Le tourbillon"
+        assert props["Metadata"].value["xesam:artist"].value == ["Artist A", "Artist B"]
+        assert 42_000_000 <= props["Position"].value < 52_000_000
+        assert props["CanControl"].value is False
+        assert root.body[0]["Identity"].value == "librespot"
+        assert refused.message_type == MessageType.ERROR
+        assert refused.error_name == "org.freedesktop.DBus.Error.NotSupported"
+
+        ctrl.stdin.close()
+        assert ctrl.wait(timeout=10) == 0
+    finally:
+        ctrl.kill()
+        ctrl.wait()
+
+
+def test_mpris_name_already_owned_fails_before_ready(tmp_path, bus_address):
+    env = {"PATH": os.environ["PATH"], "XDG_RUNTIME_DIR": str(tmp_path), "DBUS_SESSION_BUS_ADDRESS": bus_address}
+    first = start_control(env)
+    try:
+        assert json.loads(first.stdout.readline())["method"] == "Plugin.Stream.Ready"
+        second_env = {**env, "XDG_RUNTIME_DIR": str(tmp_path / "second")}
+        (tmp_path / "second").mkdir()
+        second = start_control(second_env)
+        out, err = second.communicate(timeout=10)
+        assert second.returncode != 0
+        assert out == ""
+        assert "already owned" in err
+    finally:
+        first.kill()
+        first.wait()
+
+
+def test_mpris_without_session_bus_fails_before_ready(tmp_path):
+    env = {"PATH": os.environ["PATH"], "XDG_RUNTIME_DIR": str(tmp_path)}
+    ctrl = start_control(env)
+    out, err = ctrl.communicate(timeout=10)
+    assert ctrl.returncode != 0
+    assert out == ""

@@ -133,7 +133,7 @@ class PlayerInterface(ServiceInterface):
     def _position_us(self) -> int:
         """Position in microseconds, extrapolated while playing."""
         props = self._player.properties
-        position = props.get("position", 0.0)
+        position: float = props.get("position", 0.0)
         if props["playbackStatus"] == "playing":
             position += time.monotonic() - self._player.position_at
             duration = props.get("metadata", {}).get("duration")
