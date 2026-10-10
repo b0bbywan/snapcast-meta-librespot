@@ -1,3 +1,23 @@
+[project]
+name = "snapcast-meta-librespot"
+version = "0.1.0"
+description = "Snapcast control script for librespot, fed by its --onevent hook"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.11"
+
+# Two standalone scripts, not an installable package.
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    # Only needed at runtime with --mpris; the tests cover it.
+    "dbus-fast>=2.44",
+    "mypy>=2.4.0",
+    "pytest>=8.3",
+    "ruff>=0.16",
+]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
@@ -13,3 +33,18 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM"]
 # dbus-fast reads D-Bus signatures from annotations ("s", "a{sv}", ...),
 # which ruff takes for forward references.
 "meta_librespot_mpris.py" = ["F821", "F722", "UP037"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["meta_librespot.py", "meta_librespot_mpris.py"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_optional = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# dbus-fast reads D-Bus signatures from annotations ("s", "a{sv}", ...), which
+# are not Python types, and its methods carry no return annotation.
+module = "meta_librespot_mpris"
+disable_error_code = ["name-defined", "valid-type", "no-untyped-def"]
